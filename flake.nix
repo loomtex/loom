@@ -235,6 +235,7 @@
                 ];
                 forwardPorts = [
                   { from = "host"; host.port = 2222; guest.port = 22; }
+                  { from = "host"; host.port = 9090; guest.port = 9090; }
                 ];
               };
             };
