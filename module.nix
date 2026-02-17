@@ -83,6 +83,7 @@ in
 
         persist = [ "projects" ".claude" ];
         sudo.enable = true;
+        portal.enable = true;
 
         packages = [ pkgs.nvd ];
 
@@ -130,10 +131,9 @@ in
           # Give networkmanager a moment to connect
           sleep 2
 
-          # Launch Ada via machinectl shell (proper login environment)
-          # Fall back to a plain shell if machinectl isn't available
-          exec /run/current-system/sw/bin/machinectl shell ada@ \
-            ${pkgs.bash}/bin/bash -l -c \
+          # Launch Ada's claude-code in her environment
+          # sudo -u ada + bash -l sources ada's home-manager profile
+          exec sudo -u ada ${pkgs.bash}/bin/bash -l -c \
             "cd ~/projects && exec claude"
         '';
       in "${pkgs.foot}/bin/foot --fullscreen ${ada-session}";
@@ -145,7 +145,17 @@ in
       user = cfg.humanUser;
     };
 
-    # Polkit for machinectl shell access
+    # Let the human user sudo to ada without a password (for the kiosk session)
+    security.sudo.extraRules = lib.mkIf (!cfg.setupComplete) [
+      {
+        users = [ cfg.humanUser ];
+        runAs = "ada:ada";
+        commands = [
+          { command = "ALL"; options = [ "NOPASSWD" "SETENV" ]; }
+        ];
+      }
+    ];
+
     security.polkit.enable = true;
 
     # ── Audio/Video Basics ───────────────────────────────────────

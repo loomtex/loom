@@ -35,32 +35,35 @@
     systems = [ "x86_64-linux" "aarch64-linux" ];
     forAllSystems = nixpkgs.lib.genAttrs systems;
 
+    # Common modules shared between installer target, VM, and real installs
+    loomModules = system: [
+      ./module.nix
+      nuketown.nixosModules.default
+      home-manager.nixosModules.home-manager
+      impermanence.nixosModules.impermanence
+      sops-nix.nixosModules.sops
+      ({ config, pkgs, ... }: {
+        nixpkgs.overlays = [
+          (final: prev: {
+            unstable = import nixpkgs-unstable {
+              inherit system;
+              config.allowUnfree = true;
+            };
+          })
+        ];
+      })
+    ];
+
     # Build an installer ISO for a given system architecture
     mkInstaller = { system }:
     let
       pkgs = import nixpkgs { inherit system; };
       lib = pkgs.lib;
 
-      # The target system that will be installed
       targetSystem = nixpkgs.lib.nixosSystem {
         inherit system;
-        modules = [
-          ./module.nix
-          nuketown.nixosModules.default
-          home-manager.nixosModules.home-manager
-          impermanence.nixosModules.impermanence
+        modules = (loomModules system) ++ [
           disko.nixosModules.disko
-          sops-nix.nixosModules.sops
-          ({ config, pkgs, ... }: {
-            nixpkgs.overlays = [
-              (final: prev: {
-                unstable = import nixpkgs-unstable {
-                  inherit system;
-                  config.allowUnfree = true;
-                };
-              })
-            ];
-          })
           ({ pkgs, ... }: {
             system.stateVersion = "25.11";
             nixpkgs.config.allowUnfreePredicate = pkg:
@@ -114,7 +117,6 @@
                 echo "Ada will help you set up your system after the first boot."
                 echo ""
 
-                # List available disks
                 echo "Available disks:"
                 ${pkgs.util-linux}/bin/lsblk -d -o NAME,SIZE,MODEL | grep -v loop
                 echo ""
@@ -134,7 +136,6 @@
                 echo ""
                 echo "Partitioning $DISK..."
 
-                # Simple partition layout: 512M EFI + rest ext4
                 ${pkgs.parted}/bin/parted -s "$DISK" -- \
                   mklabel gpt \
                   mkpart boot fat32 1MiB 512MiB \
@@ -143,7 +144,6 @@
 
                 PART1="''${DISK}1"
                 PART2="''${DISK}2"
-                # Handle NVMe naming (p1, p2)
                 if [[ "$DISK" == *nvme* ]] || [[ "$DISK" == *mmcblk* ]]; then
                   PART1="''${DISK}p1"
                   PART2="''${DISK}p2"
@@ -180,6 +180,71 @@
     in
     installerSystem;
 
+    # VM for testing the first-boot experience
+    # Build: nix build .#vm
+    # Run:   ./result/bin/run-loom-vm
+    mkVM = { system ? "x86_64-linux" }:
+    let
+      vmSystem = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = (loomModules system) ++ [
+          ({ config, pkgs, lib, ... }: {
+            system.stateVersion = "25.11";
+            nixpkgs.config.allowUnfreePredicate = pkg:
+              builtins.elem (lib.getName pkg) [ "claude-code" ];
+
+            boot.loader.grub.device = "/dev/vda";
+            fileSystems."/" = {
+              device = "/dev/vda1";
+              fsType = "ext4";
+            };
+
+            networking.hostName = "loom";
+
+            loom.enable = true;
+
+            home-manager.useGlobalPkgs = true;
+            home-manager.useUserPackages = true;
+
+            # Mock sudo approval so it auto-approves in the VM
+            systemd.tmpfiles.rules = [
+              "d /run/nuketown-broker 2750 user nuketown-broker -"
+              "f /run/nuketown-broker/mode 0644 user users - MOCK_APPROVED"
+            ];
+
+            # SSH access for debugging — ada's key authorized on both users
+            users.users.user.openssh.authorizedKeys.keys = [
+              "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH4wKwiX1fnwB/U4Mc7JT4ddMExopexk0DUSd7Du12Sp"
+            ];
+            users.users.ada = {
+              openssh.authorizedKeys.keys = [
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH4wKwiX1fnwB/U4Mc7JT4ddMExopexk0DUSd7Du12Sp"
+              ];
+            };
+
+            # VM resources and display
+            virtualisation.vmVariant = {
+              virtualisation = {
+                memorySize = 4096;
+                cores = 4;
+                diskSize = 20480;
+                graphics = true;
+                qemu.options = [
+                  "-vga virtio"
+                  "-display gtk,gl=on"
+                ];
+                forwardPorts = [
+                  { from = "host"; host.port = 2222; guest.port = 22; }
+                ];
+              };
+            };
+          })
+        ];
+      };
+    in
+    # vmVariant is a separate evaluated NixOS config with virtualisation options
+    vmSystem.config.virtualisation.vmVariant.system.build.vm;
+
   in {
     # The loom NixOS module — import this in your configuration
     nixosModules.default = { ... }: {
@@ -201,6 +266,12 @@
       description = "Loom — conversational NixOS setup with Ada";
     };
 
+    # Test VM — build and run:
+    #   nix build .#vm
+    #   ./result/bin/run-loom-vm
+    packages.x86_64-linux.vm = mkVM {};
+    packages.aarch64-linux.vm = mkVM { system = "aarch64-linux"; };
+
     # Development shell
     devShells = forAllSystems (system:
       let pkgs = import nixpkgs { inherit system; };
@@ -210,6 +281,7 @@
           shellHook = ''
             echo "Loom development shell"
             echo ""
+            echo "Build VM:       nix build .#vm"
             echo "Build installer: nix build .#nixosConfigurations.installer-x86_64.config.system.build.isoImage"
             echo ""
           '';
