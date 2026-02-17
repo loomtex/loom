@@ -8,6 +8,8 @@
 let
   cfg = config.loom;
   prompt = import ./prompt.nix { inherit lib; };
+  inSetup = cfg.setupPhase != "complete";
+  inKiosk = cfg.setupPhase == "kiosk";
 
   # URL handler for OOTB kiosk — pops a tmux split with QR code.
   # Runs as ada inside ada's tmux session.
@@ -263,7 +265,7 @@ let
   '';
 
   # Wrapper that checks for credentials, runs auth server if needed,
-  # then launches claude
+  # then launches claude. Accepts "resume" argument to continue a session.
   loom-ada-claude = pkgs.writeShellScript "loom-ada-claude" ''
     CRED_FILE="$HOME/.claude/.credentials.json"
     API_KEY_FILE="$HOME/.claude/.api-key"
@@ -291,20 +293,38 @@ let
 
     export BROWSER=${loom-open}/bin/loom-open
     cd ~/projects
-    exec claude --dangerously-skip-permissions "Hi! I just installed Loom and booted for the first time. Help me set up my system."
+
+    case "''${1:-initial}" in
+      resume)
+        exec claude --dangerously-skip-permissions --continue
+        ;;
+      *)
+        exec claude --dangerously-skip-permissions "Hi! I just installed Loom and booted for the first time. Help me set up my system."
+        ;;
+    esac
   '';
+
+  # Resume script — runs as the human user, sudos to ada, continues
+  # the conversation. Used in compositor autostart rules after the
+  # kiosk → desktop transition.
+  loom-ada-resume = pkgs.writeShellScriptBin "loom-ada-resume" ''
+    exec sudo -u ada ${pkgs.bash}/bin/bash -l -c "exec ${loom-ada-claude} resume"
+  '';
+
 in
 {
   options.loom = {
     enable = lib.mkEnableOption "Loom — conversational system setup with Ada";
 
-    setupComplete = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
+    setupPhase = lib.mkOption {
+      type = lib.types.enum [ "kiosk" "desktop" "complete" ];
+      default = "kiosk";
       description = ''
-        Set to true after first setup is complete.
-        When false, the system boots into a kiosk session with Ada.
-        When true, the system boots normally through the configured display manager.
+        Current setup phase:
+        - "kiosk": First boot. Cage kiosk with Ada. User chooses a desktop.
+        - "desktop": Desktop configured. Ada resumes in the new environment.
+          Auto-login and user→ada sudo still active.
+        - "complete": Setup done. Normal operation with greeter and approval daemon.
       '';
     };
 
@@ -331,9 +351,9 @@ in
 
     networking.networkmanager.enable = true;
 
-    # Open the auth server port during setup so the user can paste
+    # Open the auth server port during kiosk phase so the user can paste
     # credentials from their phone via the local network
-    networking.firewall.allowedTCPPorts = lib.mkIf (!cfg.setupComplete) [ 9090 ];
+    networking.firewall.allowedTCPPorts = lib.mkIf inKiosk [ 9090 ];
     time.timeZone = lib.mkDefault "UTC";
     i18n.defaultLocale = lib.mkDefault "en_US.UTF-8";
 
@@ -375,7 +395,7 @@ in
         portal.enable = true;
 
         packages = [ pkgs.nvd ]
-          ++ lib.optionals (!cfg.setupComplete) [ loom-xdg-open ];
+          ++ lib.optionals inSetup [ loom-xdg-open ];
 
         claudeCode = {
           enable = true;
@@ -385,9 +405,9 @@ in
             };
           };
           extraPrompt =
-            if cfg.setupComplete
-            then prompt.normalMode
-            else prompt.setupMode;
+            if inSetup
+            then prompt.setupMode
+            else prompt.normalMode;
         };
 
         extraHomeConfig = {
@@ -406,14 +426,12 @@ in
       home.stateVersion = "25.11";
     };
 
-    # ── OOTB Kiosk Session (first boot) ──────────────────────────
-    # When setup is not complete, boot into a cage kiosk running
-    # a terminal with Ada (claude-code).
-    #
-    # After Ada configures a desktop, she sets loom.setupComplete = true
-    # and the next boot goes through the normal display manager.
+    # ── OOTB Kiosk Session (kiosk phase only) ────────────────────
+    # Cage runs a fullscreen terminal with Ada. After Ada configures
+    # a desktop and switches to "desktop" phase, cage is no longer
+    # configured and the real compositor takes over.
 
-    services.cage = lib.mkIf (!cfg.setupComplete) {
+    services.cage = lib.mkIf inKiosk {
       enable = true;
       user = cfg.humanUser;
       program = let
@@ -435,14 +453,18 @@ in
       in "${pkgs.foot}/bin/foot --fullscreen ${ada-session}";
     };
 
-    # Auto-login for the kiosk session
-    services.displayManager.autoLogin = lib.mkIf (!cfg.setupComplete) {
+    # Auto-login during kiosk and desktop phases
+    # In kiosk: logs into cage. In desktop: logs into the new compositor.
+    # Removed by Ada in the final phase when she configures the greeter.
+    services.displayManager.autoLogin = lib.mkIf inSetup {
       enable = true;
       user = cfg.humanUser;
     };
 
-    # Let the human user sudo to ada without a password (for the kiosk session)
-    security.sudo.extraRules = lib.mkIf (!cfg.setupComplete) [
+    # Let the human user sudo to ada without a password (for kiosk and desktop phases)
+    # In kiosk: the cage → foot → sudo -u ada chain
+    # In desktop: the loom-ada-resume autostart script
+    security.sudo.extraRules = lib.mkIf inSetup [
       {
         users = [ cfg.humanUser ];
         runAs = "ada:ada";
@@ -454,11 +476,15 @@ in
 
     security.polkit.enable = true;
 
+    # Make loom-ada-resume available in the human user's PATH during setup
+    # (used in compositor autostart rules after the kiosk → desktop switch)
+    environment.systemPackages = lib.mkIf inSetup [ loom-ada-resume ];
+
     # ── Bootstrap /etc/nixos ─────────────────────────────────────
     # Seed an editable NixOS flake configuration so Ada has something
     # to modify during setup. Only created if /etc/nixos/flake.nix
     # doesn't already exist.
-    system.activationScripts.loom-bootstrap = lib.mkIf (!cfg.setupComplete) ''
+    system.activationScripts.loom-bootstrap = lib.mkIf inKiosk ''
       if [ ! -f /etc/nixos/flake.nix ]; then
         mkdir -p /etc/nixos
         cat > /etc/nixos/flake.nix << 'FLAKE'
@@ -495,7 +521,8 @@ in
         system.stateVersion = "25.11";
 
         loom.enable = true;
-        # loom.setupComplete = true;  # Ada sets this when setup is done
+        # loom.setupPhase = "desktop";   # Ada changes this during setup
+        # loom.setupPhase = "complete";  # Ada sets this when fully done
 
         # ── System Packages ──
         # Ada adds packages here during setup
