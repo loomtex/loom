@@ -243,7 +243,6 @@
         ];
       };
     in
-    # vmVariant is a separate evaluated NixOS config with virtualisation options
     vmSystem.config.virtualisation.vmVariant.system.build.vm;
 
   in {

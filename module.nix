@@ -330,6 +330,10 @@ in
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
     networking.networkmanager.enable = true;
+
+    # Open the auth server port during setup so the user can paste
+    # credentials from their phone via the local network
+    networking.firewall.allowedTCPPorts = lib.mkIf (!cfg.setupComplete) [ 9090 ];
     time.timeZone = lib.mkDefault "UTC";
     i18n.defaultLocale = lib.mkDefault "en_US.UTF-8";
 
