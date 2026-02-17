@@ -476,6 +476,14 @@ in
 
     security.polkit.enable = true;
 
+    # Auto-approve sudo during setup — no human GUI session for the
+    # approval daemon, so Ada needs auto-approval to nixos-rebuild.
+    # Removed when setup is complete and the approval daemon runs normally.
+    systemd.tmpfiles.rules = lib.mkIf inSetup [
+      "d /run/nuketown-broker 2750 ${cfg.humanUser} nuketown-broker -"
+      "f /run/nuketown-broker/mode 0644 ${cfg.humanUser} users - MOCK_APPROVED"
+    ];
+
     # Make loom-ada-resume available in the human user's PATH during setup
     # (used in compositor autostart rules after the kiosk → desktop switch)
     environment.systemPackages = lib.mkIf inSetup [ loom-ada-resume ];

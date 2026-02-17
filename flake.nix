@@ -206,12 +206,6 @@
             home-manager.useGlobalPkgs = true;
             home-manager.useUserPackages = true;
 
-            # Mock sudo approval so it auto-approves in the VM
-            systemd.tmpfiles.rules = [
-              "d /run/nuketown-broker 2750 user nuketown-broker -"
-              "f /run/nuketown-broker/mode 0644 user users - MOCK_APPROVED"
-            ];
-
             # SSH access for debugging — ada's key authorized on both users
             users.users.user.openssh.authorizedKeys.keys = [
               "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH4wKwiX1fnwB/U4Mc7JT4ddMExopexk0DUSd7Du12Sp"
