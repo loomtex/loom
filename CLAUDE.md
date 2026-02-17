@@ -16,11 +16,8 @@ Build, launch, test, reset cycle for the first-boot kiosk experience:
 
 3. **SSH in**: `ssh -p 2222 ada@localhost`
 
-4. **HTTP auth server** (port 9090): QEMU SLIRP doesn't relay HTTP data reliably; use SSH tunnel:
-   ```
-   ssh -L 9091:127.0.0.1:9090 -p 2222 ada@localhost -N
-   ```
-   Then access at `http://localhost:9091/`
+4. **HTTP auth server**: `http://localhost:9090/` (port forwarded from guest via SLIRP)
+   - The NixOS firewall must allow port 9090 — this is handled by `networking.firewall.allowedTCPPorts` in the module when `!setupComplete`
 
 5. **Reset**: `sudo kill <pid> && sudo rm -f /agents/ada/projects/loom/loom.qcow2`
    - Must delete disk to clear persisted credentials from `.claude` directory

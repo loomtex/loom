@@ -291,7 +291,7 @@ let
 
     export BROWSER=${loom-open}/bin/loom-open
     cd ~/projects
-    exec claude --dangerously-skip-permissions
+    exec claude --dangerously-skip-permissions "Hi! I just installed Loom and booted for the first time. Help me set up my system."
   '';
 in
 {
@@ -453,6 +453,76 @@ in
     ];
 
     security.polkit.enable = true;
+
+    # ── Bootstrap /etc/nixos ─────────────────────────────────────
+    # Seed an editable NixOS flake configuration so Ada has something
+    # to modify during setup. Only created if /etc/nixos/flake.nix
+    # doesn't already exist.
+    system.activationScripts.loom-bootstrap = lib.mkIf (!cfg.setupComplete) ''
+      if [ ! -f /etc/nixos/flake.nix ]; then
+        mkdir -p /etc/nixos
+        cat > /etc/nixos/flake.nix << 'FLAKE'
+      {
+        description = "Loom system configuration";
+
+        inputs = {
+          nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+          home-manager = {
+            url = "github:nix-community/home-manager/release-25.11";
+            inputs.nixpkgs.follows = "nixpkgs";
+          };
+          loom.url = "github:loomtex/loom";
+          loom.inputs.nixpkgs.follows = "nixpkgs";
+        };
+
+        outputs = { nixpkgs, home-manager, loom, ... }: {
+          nixosConfigurations.loom = nixpkgs.lib.nixosSystem {
+            system = "${pkgs.stdenv.hostPlatform.system}";
+            modules = [
+              loom.nixosModules.default
+              home-manager.nixosModules.home-manager
+              ./hardware-configuration.nix
+              ./configuration.nix
+            ];
+          };
+        };
+      }
+      FLAKE
+
+        cat > /etc/nixos/configuration.nix << CONFIG
+      { config, pkgs, lib, ... }:
+      {
+        system.stateVersion = "25.11";
+
+        loom.enable = true;
+        # loom.setupComplete = true;  # Ada sets this when setup is done
+
+        # ── System Packages ──
+        # Ada adds packages here during setup
+        environment.systemPackages = with pkgs; [
+        ];
+
+        # ── Desktop ──
+        # Ada configures the desktop environment here
+
+        # ── User Environment ──
+        home-manager.useGlobalPkgs = true;
+        home-manager.useUserPackages = true;
+        home-manager.users.${cfg.humanUser} = { pkgs, ... }: {
+          home.stateVersion = "25.11";
+
+          # Ada configures user programs and dotfiles here
+        };
+      }
+      CONFIG
+
+        # Generate hardware-configuration.nix from the running system
+        ${pkgs.nixos-install-tools}/bin/nixos-generate-config --show-hardware-config > /etc/nixos/hardware-configuration.nix 2>/dev/null || true
+
+        # Make it writable by ada for editing
+        chown -R ada:ada /etc/nixos
+      fi
+    '';
 
     # ── Audio/Video Basics ───────────────────────────────────────
     security.rtkit.enable = true;
