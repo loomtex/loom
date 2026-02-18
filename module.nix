@@ -453,13 +453,9 @@ in
       in "${pkgs.foot}/bin/foot --fullscreen ${ada-session}";
     };
 
-    # Auto-login during kiosk and desktop phases
-    # In kiosk: logs into cage. In desktop: logs into the new compositor.
-    # Removed by Ada in the final phase when she configures the greeter.
-    services.displayManager.autoLogin = lib.mkIf inSetup {
-      enable = true;
-      user = cfg.humanUser;
-    };
+    # No display manager configured here — Ada sets up the appropriate
+    # display manager + auto-login as part of desktop configuration.
+    # (GNOME → gdm, Hyprland/Sway → greetd, KDE → sddm, etc.)
 
     # Let the human user sudo to ada without a password (for kiosk and desktop phases)
     # In kiosk: the cage → foot → sudo -u ada chain
@@ -524,7 +520,9 @@ in
         system.stateVersion = "25.11";
 
         # ── Boot ──
-        boot.loader.grub.device = "/dev/vda";  # Ada adjusts for real hardware
+        # Stub — Ada or the installer configures the real bootloader.
+        # "nodev" prevents grub-install from running (safe for VMs and EFI).
+        boot.loader.grub.device = lib.mkDefault "nodev";
 
         loom.enable = true;
         # loom.setupPhase = "desktop";   # Ada changes this during setup

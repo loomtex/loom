@@ -208,6 +208,7 @@
                 memorySize = 4096;
                 cores = 4;
                 diskSize = 20480;
+                writableStoreUseTmpfs = false;  # use disk for overlay upper, keep 9p host store as lower
                 graphics = true;
                 qemu.options = [
                   "-vga virtio"

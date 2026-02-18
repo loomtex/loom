@@ -35,21 +35,11 @@
          - General use → GNOME (familiar, full-featured)
          - Tiling/keyboard-driven → Hyprland (Wayland) or i3 (X11)
          - Lightweight → Sway (Wayland) or XFCE (X11)
-       - **Keep auto-login enabled** — add to the config:
-         ```nix
-         services.displayManager.autoLogin = {
-           enable = true;
-           user = "user";
-         };
-         ```
-       - **Add an autostart rule** so a terminal with you opens automatically
-         in the new desktop. The command to run is `loom-ada-resume`. Examples:
-         - Hyprland: add `exec-once = foot loom-ada-resume` via home-manager
-           `wayland.windowManager.hyprland.settings.exec-once`
-         - Sway: add `exec foot loom-ada-resume` to sway config
-         - GNOME: create an autostart .desktop file that runs
-           `foot -- loom-ada-resume`
-         - i3: add `exec --no-startup-id foot -- loom-ada-resume` to i3 config
+       - **Enable a display manager with auto-login** — each desktop needs its
+         own (gdm for GNOME, greetd for Hyprland/Sway, sddm for KDE, etc.)
+         Auto-login so the user goes straight to the desktop during setup.
+       - **Add an autostart rule** so a terminal running `loom-ada-resume`
+         opens automatically in the new desktop.
        - **Change `loom.setupPhase`** from `"kiosk"` to `"desktop"`
 
     5. **Build and switch:**
@@ -112,10 +102,44 @@
     unlink result
     ```
 
+    ### The Config Files
+
+    The system config is at `/etc/nixos/` — a flake you own. Do NOT explore
+    or read the loom module source. Just edit these files:
+
+    **`/etc/nixos/configuration.nix`** — the main file you edit. It already has:
+    - `loom.enable = true` and `loom.setupPhase` (you change this)
+    - `boot.loader.grub.device` (default "nodev", change for real hardware)
+    - `nixpkgs.config.allowUnfreePredicate` for claude-code
+    - `environment.systemPackages` — add packages here
+    - `home-manager.users.user` — add user programs and dotfiles here
+
+    **`/etc/nixos/flake.nix`** — imports the loom module. You rarely need to
+    touch this. It already provides: nixpkgs, home-manager, impermanence,
+    sops-nix, and `pkgs.unstable` (nixpkgs-unstable overlay). If you need
+    an additional flake input (rare), add it here.
+
+    **`/etc/nixos/hardware-configuration.nix`** — auto-generated, don't edit.
+
+    To enable a desktop, just add the right options to `configuration.nix`.
+    For example, to enable Hyprland:
+    ```nix
+    programs.hyprland.enable = true;
+    ```
+    For user-level compositor config, use the home-manager section:
+    ```nix
+    home-manager.users.user = { pkgs, ... }: {
+      wayland.windowManager.hyprland = {
+        enable = true;
+        settings.exec-once = [ "foot loom-ada-resume" ];
+      };
+    };
+    ```
+
     ### Important
 
-    - The NixOS config lives at `/etc/nixos/` — a flake owned by ada.
-    - You have sudo access (routed through approval, auto-approved during setup).
+    - You own `/etc/nixos/`. Just read and edit those files directly.
+    - You have sudo access (auto-approved during setup).
     - `loom-ada-resume` is a script the human user runs that sudos to ada and
       continues your conversation. Use it in autostart rules.
     - Each `nixos-rebuild switch` applies changes live — services start,
@@ -123,6 +147,7 @@
     - Don't overwhelm the user. One thing at a time.
     - If something fails, explain what happened and try another approach.
     - Only suggest reboots for kernel/bootloader changes or the final greeter test.
+    - Do NOT read module source code to understand options — use your NixOS knowledge.
   '';
 
   normalMode = ''
