@@ -36,22 +36,8 @@
     forAllSystems = nixpkgs.lib.genAttrs systems;
 
     # Common modules shared between installer target, VM, and real installs
-    loomModules = system: [
-      ./module.nix
-      nuketown.nixosModules.default
-      home-manager.nixosModules.home-manager
-      impermanence.nixosModules.impermanence
-      sops-nix.nixosModules.sops
-      ({ config, pkgs, ... }: {
-        nixpkgs.overlays = [
-          (final: prev: {
-            unstable = import nixpkgs-unstable {
-              inherit system;
-              config.allowUnfree = true;
-            };
-          })
-        ];
-      })
+    loomModules = [
+      self.nixosModules.default
     ];
 
     # Build an installer ISO for a given system architecture
@@ -62,7 +48,7 @@
 
       targetSystem = nixpkgs.lib.nixosSystem {
         inherit system;
-        modules = (loomModules system) ++ [
+        modules = (loomModules) ++ [
           disko.nixosModules.disko
           ({ pkgs, ... }: {
             system.stateVersion = "25.11";
@@ -187,7 +173,7 @@
     let
       vmSystem = nixpkgs.lib.nixosSystem {
         inherit system;
-        modules = (loomModules system) ++ [
+        modules = (loomModules) ++ [
           ({ config, pkgs, lib, ... }: {
             system.stateVersion = "25.11";
             nixpkgs.config.allowUnfreePredicate = pkg:
@@ -240,11 +226,23 @@
     vmSystem.config.virtualisation.vmVariant.system.build.vm;
 
   in {
-    # The loom NixOS module — import this in your configuration
-    nixosModules.default = { ... }: {
+    # The loom NixOS module — import this in your configuration.
+    # Includes all dependencies (nuketown, impermanence, sops, unstable overlay).
+    nixosModules.default = { pkgs, ... }: {
       imports = [
-        nuketown.nixosModules.default
         ./module.nix
+        nuketown.nixosModules.default
+        home-manager.nixosModules.home-manager
+        impermanence.nixosModules.impermanence
+        sops-nix.nixosModules.sops
+      ];
+      nixpkgs.overlays = [
+        (final: prev: {
+          unstable = import nixpkgs-unstable {
+            inherit (pkgs.stdenv.hostPlatform) system;
+            config.allowUnfree = true;
+          };
+        })
       ];
     };
 

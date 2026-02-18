@@ -296,10 +296,10 @@ let
 
     case "''${1:-initial}" in
       resume)
-        exec claude --dangerously-skip-permissions --continue
+        exec claude --dangerously-skip-permissions --model claude-opus-4-6 --continue
         ;;
       *)
-        exec claude --dangerously-skip-permissions "Hi! I just installed Loom and booted for the first time. Help me set up my system."
+        exec claude --dangerously-skip-permissions --model claude-opus-4-6 "Hi! I just installed Loom and booted for the first time. Help me set up my system."
         ;;
     esac
   '';
@@ -501,20 +501,15 @@ in
 
         inputs = {
           nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
-          home-manager = {
-            url = "github:nix-community/home-manager/release-25.11";
-            inputs.nixpkgs.follows = "nixpkgs";
-          };
           loom.url = "github:loomtex/loom";
           loom.inputs.nixpkgs.follows = "nixpkgs";
         };
 
-        outputs = { nixpkgs, home-manager, loom, ... }: {
+        outputs = { nixpkgs, loom, ... }: {
           nixosConfigurations.loom = nixpkgs.lib.nixosSystem {
             system = "${pkgs.stdenv.hostPlatform.system}";
             modules = [
               loom.nixosModules.default
-              home-manager.nixosModules.home-manager
               ./hardware-configuration.nix
               ./configuration.nix
             ];
@@ -528,9 +523,15 @@ in
       {
         system.stateVersion = "25.11";
 
+        # ── Boot ──
+        boot.loader.grub.device = "/dev/vda";  # Ada adjusts for real hardware
+
         loom.enable = true;
         # loom.setupPhase = "desktop";   # Ada changes this during setup
         # loom.setupPhase = "complete";  # Ada sets this when fully done
+
+        nixpkgs.config.allowUnfreePredicate = pkg:
+          builtins.elem (lib.getName pkg) [ "claude-code" ];
 
         # ── System Packages ──
         # Ada adds packages here during setup
