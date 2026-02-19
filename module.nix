@@ -11,6 +11,12 @@ let
   inSetup = cfg.setupPhase != "complete";
   inKiosk = cfg.setupPhase == "kiosk";
 
+  # Read our own flake.lock to pin nixpkgs in the bootstrap /etc/nixos
+  # so builds inside the VM (or first boot) match the host's nix store.
+  loomLock = builtins.fromJSON (builtins.readFile ./flake.lock);
+  nixpkgsNodeName = loomLock.nodes.root.inputs.nixpkgs;
+  nixpkgsLocked = loomLock.nodes.${nixpkgsNodeName}.locked;
+
   # URL handler for OOTB kiosk — pops a tmux split with QR code.
   # Runs as ada inside ada's tmux session.
   loom-open = pkgs.writeShellScriptBin "loom-open" ''
@@ -292,7 +298,7 @@ let
     fi
 
     export BROWSER=${loom-open}/bin/loom-open
-    cd ~/projects
+    cd ~/projects/system
 
     case "''${1:-initial}" in
       resume)
@@ -403,6 +409,7 @@ in
             permissions = {
               defaultMode = "bypassPermissions";
             };
+            spinnerTipsEnabled = false;
           };
           extraPrompt =
             if inSetup
@@ -480,23 +487,43 @@ in
       "f /run/nuketown-broker/mode 0644 ${cfg.humanUser} users - MOCK_APPROVED"
     ];
 
+    # Ensure home-manager has activated the user's profile before the
+    # display manager starts — otherwise auto-login can launch the
+    # compositor before ~/.config exists (no HM-managed config).
+    systemd.services.display-manager = lib.mkIf inSetup {
+      after = [ "home-manager-${cfg.humanUser}.service" ];
+      wants = [ "home-manager-${cfg.humanUser}.service" ];
+    };
+
     # Make loom-ada-resume available in the human user's PATH during setup
     # (used in compositor autostart rules after the kiosk → desktop switch)
     environment.systemPackages = lib.mkIf inSetup [ loom-ada-resume ];
 
     # ── Bootstrap /etc/nixos ─────────────────────────────────────
     # Seed an editable NixOS flake configuration so Ada has something
-    # to modify during setup. Only created if /etc/nixos/flake.nix
-    # doesn't already exist.
-    system.activationScripts.loom-bootstrap = lib.mkIf inKiosk ''
-      if [ ! -f /etc/nixos/flake.nix ]; then
-        mkdir -p /etc/nixos
-        cat > /etc/nixos/flake.nix << 'FLAKE'
+    # to modify during setup. Runs as a systemd service (not activation
+    # script) so it executes AFTER impermanence bind mounts are up.
+    systemd.services.loom-bootstrap = lib.mkIf inKiosk (let
+      sysDir = "${config.nuketown.agentsDir}/ada/projects/system";
+    in {
+      description = "Bootstrap Loom system configuration";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "local-fs.target" ];
+      before = [ "cage-tty1.service" ];
+      unitConfig.ConditionPathExists = "!${sysDir}/flake.nix";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        mkdir -p ${sysDir}
+
+        cat > ${sysDir}/flake.nix << 'FLAKE'
       {
         description = "Loom system configuration";
 
         inputs = {
-          nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+          nixpkgs.url = "github:nixos/nixpkgs/${nixpkgsLocked.rev}";
           loom.url = "github:loomtex/loom";
           loom.inputs.nixpkgs.follows = "nixpkgs";
         };
@@ -514,15 +541,22 @@ in
       }
       FLAKE
 
-        cat > /etc/nixos/configuration.nix << CONFIG
+        # Detect boot firmware and set the right bootloader
+        if [ -d /sys/firmware/efi ]; then
+          BOOT_CONFIG='boot.loader.systemd-boot.enable = true;
+        boot.loader.efi.canTouchEfiVariables = true;'
+        else
+          BOOT_CONFIG='# Ada configures grub.device for the target disk
+        boot.loader.grub.device = lib.mkDefault "nodev";'
+        fi
+
+        cat > ${sysDir}/configuration.nix << CONFIG
       { config, pkgs, lib, ... }:
       {
         system.stateVersion = "25.11";
 
         # ── Boot ──
-        # Stub — Ada or the installer configures the real bootloader.
-        # "nodev" prevents grub-install from running (safe for VMs and EFI).
-        boot.loader.grub.device = lib.mkDefault "nodev";
+        $BOOT_CONFIG
 
         loom.enable = true;
         # loom.setupPhase = "desktop";   # Ada changes this during setup
@@ -550,13 +584,132 @@ in
       }
       CONFIG
 
+        cat > ${sysDir}/CLAUDE.md << 'CLAUDEMD'
+      # System Configuration
+
+      This is the NixOS system configuration flake. Edit `configuration.nix`
+      for system and user changes. The flake provides nixpkgs, home-manager,
+      impermanence, sops-nix, and a `pkgs.unstable` overlay.
+
+      ## NixOS 25.11 Gotchas
+
+      ### Display Manager Options
+      - `services.xserver.displayManager.autoLogin` is deprecated
+      - Use `services.displayManager.autoLogin` (top-level, not under xserver)
+
+      ### Home-Manager Neovim
+      - **Treesitter**: Use `programs.neovim.plugins` with
+        `pkgs.vimPlugins.nvim-treesitter.withPlugins (p: [ p.nix p.lua ... ])`
+        Do NOT use the old `configure.packages` or `configure.customRC` approach.
+      - **LSP**: Use `pkgs.vimPlugins.nvim-lspconfig` as a plugin and configure
+        servers in `extraLuaConfig`. There is no `programs.neovim.lsp` option.
+      - **Plugin config**: Use `extraLuaConfig` for Lua or `extraConfig` for
+        vimscript. Prefer Lua for modern plugins.
+
+      ### Hyprland
+      - System-level: `programs.hyprland.enable = true;`
+      - User-level config via home-manager: `wayland.windowManager.hyprland`
+      - Both are needed — system-level provides the binary and session,
+        user-level provides the config file.
+
+      ### Packages
+      - Use `pkgs.unstable.<pkg>` for packages that need a newer version
+        than the 25.11 release branch provides.
+      CLAUDEMD
+
         # Generate hardware-configuration.nix from the running system
-        ${pkgs.nixos-install-tools}/bin/nixos-generate-config --show-hardware-config > /etc/nixos/hardware-configuration.nix 2>/dev/null || true
+        ${pkgs.nixos-install-tools}/bin/nixos-generate-config --show-hardware-config > ${sysDir}/hardware-configuration.nix 2>/dev/null || true
 
         # Make it writable by ada for editing
-        chown -R ada:ada /etc/nixos
+        chown -R ada:ada ${sysDir}
+
+        # Symlink /etc/nixos so standard NixOS tools work
+        rm -rf /etc/nixos
+        ln -s ${sysDir} /etc/nixos
+      '';
+    });
+
+    # Ensure /etc/nixos symlink exists (runs every activation, even after
+    # bootstrap has already created the project dir on a previous boot).
+    system.activationScripts.loom-etcnixos-symlink = lib.mkIf inKiosk (let
+      sysDir = "${config.nuketown.agentsDir}/ada/projects/system";
+    in ''
+      if [ -d ${sysDir} ] && { [ ! -L /etc/nixos ] || [ "$(readlink /etc/nixos)" != "${sysDir}" ]; }; then
+        rm -rf /etc/nixos
+        ln -s ${sysDir} /etc/nixos
       fi
-    '';
+    '');
+
+    # If local loom source is available via 9p (VM testing), patch the
+    # bootstrap flake to use it instead of the GitHub URL. Runs after
+    # loom-bootstrap so the files exist.
+    systemd.services.loom-dev-source = lib.mkIf inKiosk (let
+      sysDir = "${config.nuketown.agentsDir}/ada/projects/system";
+    in {
+      description = "Patch Loom config for local development source";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "local-fs.target" "loom-bootstrap.service" ];
+      before = [ "cage-tty1.service" ];
+      unitConfig.ConditionPathExists = "/tmp/loom-src/module.nix";
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        if [ -f ${sysDir}/flake.nix ]; then
+          ${pkgs.gnused}/bin/sed -i 's|loom.url = "github:loomtex/loom"|loom.url = "path:/tmp/loom-src"|' ${sysDir}/flake.nix
+
+          # Regenerate hardware-configuration.nix so it gets the base
+          # hardware right (disk UUIDs, qemu-guest profile, etc).
+          ${pkgs.nixos-install-tools}/bin/nixos-generate-config --show-hardware-config > ${sysDir}/hardware-configuration.nix 2>/dev/null || true
+
+          # nixos-generate-config detects the 9p/overlay mounts but produces
+          # broken entries (missing mount options). Remove them — we provide
+          # correct entries in vm-store.nix instead.
+          ${pkgs.gnused}/bin/sed -i '/fileSystems."\/nix\/.ro-store"/,/};/d' ${sysDir}/hardware-configuration.nix
+          ${pkgs.gnused}/bin/sed -i '/fileSystems."\/nix\/store"/,/};/d' ${sysDir}/hardware-configuration.nix
+          ${pkgs.gnused}/bin/sed -i '/fileSystems."\/tmp\/loom-src"/,/};/d' ${sysDir}/hardware-configuration.nix
+          ${pkgs.gnused}/bin/sed -i '/fileSystems."\/tmp\/shared"/,/};/d' ${sysDir}/hardware-configuration.nix
+          ${pkgs.gnused}/bin/sed -i '/fileSystems."\/tmp\/xchg"/,/};/d' ${sysDir}/hardware-configuration.nix
+
+          # Add import for vm-store.nix
+          ${pkgs.gnused}/bin/sed -i 's|imports =|imports = [ ./vm-store.nix ]  ++|' ${sysDir}/hardware-configuration.nix
+
+          # Write proper VM store mounts with correct options
+          cat > ${sysDir}/vm-store.nix << 'VMSTORE'
+        # VM-specific nix store mounts (9p host store + overlayfs).
+        # Auto-generated by loom-dev-source — only present in VM testing.
+        {
+          boot.initrd.availableKernelModules = [ "9p" "9pnet_virtio" "overlay" ];
+
+          fileSystems."/nix/.ro-store" = {
+            device = "nix-store";
+            fsType = "9p";
+            options = [ "trans=virtio" "version=9p2000.L" "cache=loose" ];
+            neededForBoot = true;
+          };
+
+          fileSystems."/nix/store" = {
+            overlay = {
+              lowerdir = [ "/nix/.ro-store" ];
+              upperdir = "/nix/.rw-store/upper";
+              workdir = "/nix/.rw-store/work";
+            };
+            neededForBoot = true;
+          };
+
+          fileSystems."/tmp/loom-src" = {
+            device = "loom-src";
+            fsType = "9p";
+            options = [ "trans=virtio" "version=9p2000.L" ];
+          };
+        }
+        VMSTORE
+
+          chown ada:ada ${sysDir}/hardware-configuration.nix ${sysDir}/vm-store.nix
+        fi
+      '';
+    });
 
     # ── Audio/Video Basics ───────────────────────────────────────
     security.rtkit.enable = true;

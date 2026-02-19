@@ -15,12 +15,57 @@ Build, launch, test, reset cycle for the first-boot kiosk experience:
    - `/agents/ada` and `/agents/ada/projects` need `o+x` for josh to traverse; `/agents/ada/projects/loom` needs `o+rwx` for disk image creation
 
 3. **SSH in**: `ssh -p 2222 ada@localhost`
+   - SSH authorized keys are in the VM's flake.nix config but NOT in the bootstrap `/etc/nixos/` config. After Ada does `nixos-rebuild switch --flake /etc/nixos`, SSH key auth will be lost. Either have Ada add keys to the config, or log in as `user` with password `loom` on tty.
 
 4. **HTTP auth server**: `http://localhost:9090/` (port forwarded from guest via SLIRP)
-   - The NixOS firewall must allow port 9090 — this is handled by `networking.firewall.allowedTCPPorts` in the module when `!setupComplete`
+   - The NixOS firewall must allow port 9090 — this is handled by `networking.firewall.allowedTCPPorts` in the module during kiosk phase
 
-5. **Reset**: `sudo kill <pid> && sudo rm -f /agents/ada/projects/loom/loom.qcow2`
+5. **Reset**: Kill QEMU, delete disk, relaunch:
+   ```
+   sudo kill <pid>
+   sudo rm -f /agents/ada/projects/loom/loom.qcow2
+   ```
    - Must delete disk to clear persisted credentials from `.claude` directory
+   - Kill and rm must be separate commands — chaining with `;` after `sudo kill` can fail (exit 144 from signal)
+
+6. **Grab transcripts** before killing the VM:
+   ```
+   scp -P 2222 ada@localhost:~/.claude/projects/-agents-ada-projects/*.jsonl ./transcripts/
+   scp -P 2222 ada@localhost:/etc/nixos/configuration.nix ./transcripts/final-configuration.nix
+   ```
+
+## VM Nix Store
+
+The VM mounts the host's `/nix/store` read-only via 9p, with an overlayfs for writes:
+- **Lower layer**: host store via 9p (instant access to everything already built)
+- **Upper layer**: VM's disk image (`writableStoreUseTmpfs = false`)
+
+This means packages already in the host store are instantly available in the VM. Only new packages need to be fetched/built. To pre-warm the host store after a test session:
+```
+nix copy --from ssh-ng://ada@localhost ...  # doesn't work yet, needs investigation
+```
+In practice, most packages are fetched from cache.nixos.org and end up in both stores.
+
+### Boot Loader
+
+The VM uses `useBootLoader = true` + `useEFIBoot = true`, so it boots from a real UEFI bootloader (systemd-boot via OVMF) on the virtual disk. `nixos-rebuild switch` inside the VM updates the bootloader, and reboots boot the new system. This allows full testing of the kiosk → desktop → complete → reboot → greeter cycle.
+
+### Local Module Changes vs VM Rebuilds
+
+**CRITICAL**: The VM's initial boot uses the local loom module (baked into the
+VM image via `nix build .#vm`). But when Ada runs `nixos-rebuild switch --flake
+/etc/nixos` inside the VM, the bootstrap flake fetches `github:loomtex/loom` —
+the **published** version. Local changes to `module.nix`, `prompt.nix`, etc.
+are NOT in that build.
+
+To test local module changes end-to-end (including the desktop switch), the
+bootstrap flake must reference the local loom source, not GitHub. The VM shares
+the loom source via 9p at `/tmp/loom-src` — the bootstrap flake uses
+`loom.url = "path:/tmp/loom-src"`.
+
+### Super Key in QEMU
+
+The host window manager intercepts Super before it reaches the VM. Press **Ctrl+Alt+G** in the QEMU window to grab all keyboard input. Same combo to release.
 
 ## Auth Flow
 
@@ -40,6 +85,10 @@ Token detection:
 - `{*` → credentials JSON → `.credentials.json`
 - anything else → treated as OAuth token → `.oauth-token` → `CLAUDE_CODE_OAUTH_TOKEN`
 
+### Model Selection
+
+OAuth tokens (including setup tokens) default to Sonnet regardless of subscription tier. The wrapper passes `--model claude-opus-4-6` explicitly to ensure Opus is used. This is hardcoded in `loom-ada-claude`.
+
 ## Setup Flow — Three Phases
 
 The setup is a three-phase process. One ISO, cage as the universal
@@ -53,7 +102,7 @@ with Ada. The system has nothing but this terminal.
 ```
 cage → foot → sudo -u ada → tmux → loom-ada-claude
                                      ├─ auth server (if no creds)
-                                     └─ claude "Hi! I just installed..."
+                                     └─ claude --model claude-opus-4-6 "Hi! I just installed..."
 ```
 
 Ada greets the user and asks what they want to use the computer for.
@@ -61,7 +110,7 @@ Based on the conversation, Ada configures a desktop environment by
 editing `/etc/nixos/configuration.nix`:
 
 - Enables compositor/WM (Hyprland, Sway, GNOME, i3, etc.)
-- Adds auto-login so the user doesn't hit a login screen yet
+- Configures the appropriate display manager with auto-login (greetd for Hyprland/Sway, gdm for GNOME, sddm for KDE)
 - Adds autostart rule for the compositor: open a terminal running
   `loom-ada-resume` (which sudos to ada and runs `claude --continue`)
 - Changes `loom.setupPhase` from `"kiosk"` to `"desktop"`
@@ -120,11 +169,15 @@ chose — Wayland or X11, doesn't matter. One ISO covers everything.
 loom.setupPhase = "kiosk" | "desktop" | "complete";
 ```
 
-| Phase     | Cage | Auto-login | user→ada sudo | Firewall 9090 | Bootstrap /etc/nixos |
-|-----------|------|------------|---------------|---------------|---------------------|
-| kiosk     | yes  | yes        | yes           | yes           | yes                 |
-| desktop   | no   | yes        | yes           | no            | no                  |
-| complete  | no   | no         | no            | no            | no                  |
+| Phase     | Cage | Auto-login | user→ada sudo | Firewall 9090 | Bootstrap /etc/nixos | Mock approval |
+|-----------|------|------------|---------------|---------------|---------------------|---------------|
+| kiosk     | yes  | N/A (cage) | yes           | yes           | yes                 | yes           |
+| desktop   | no   | Ada config | yes           | no            | no                  | yes           |
+| complete  | no   | no         | no            | no            | no                  | no            |
+
+Note: Auto-login in the desktop phase is NOT handled by the loom module. Ada configures
+the appropriate display manager (greetd, gdm, sddm) with auto-login as part of the
+desktop setup. The module stays out of display manager business.
 
 ### Scripts
 
@@ -135,11 +188,50 @@ loom.setupPhase = "kiosk" | "desktop" | "complete";
 - **`loom-ada-resume`**: Runs as the human user. Sudos to ada, launches
   `loom-ada-claude resume`. Used in desktop compositor autostart rules.
 
+## Bootstrap `/etc/nixos/`
+
+On first boot (kiosk phase), an activation script seeds `/etc/nixos/` with:
+
+- **`flake.nix`**: Imports `loom.nixosModules.default` (which transitively includes
+  nuketown, home-manager, impermanence, sops-nix, and the nixpkgs-unstable overlay).
+  The user's flake only needs `nixpkgs` and `loom` as inputs.
+
+- **`configuration.nix`**: Starter config with `loom.enable = true`, `allowUnfreePredicate`
+  for claude-code, stub boot loader (`grub.device = mkDefault "nodev"`), empty
+  `environment.systemPackages`, and a bare `home-manager.users.user` section.
+
+- **`hardware-configuration.nix`**: Auto-generated via `nixos-generate-config`.
+
+All files are owned by `ada:ada` so Ada can edit them directly.
+
+### `nixosModules.default` Bundles Everything
+
+The loom NixOS module (`loom.nixosModules.default`) includes all transitive dependencies:
+- `nuketown.nixosModules.default`
+- `home-manager.nixosModules.home-manager`
+- `impermanence.nixosModules.impermanence`
+- `sops-nix.nixosModules.sops`
+- nixpkgs-unstable overlay (provides `pkgs.unstable.*`)
+
+Downstream flakes should NOT need to import these separately. If Ada needs an external
+flake input (e.g. zen-browser), she adds it to `/etc/nixos/flake.nix`.
+
 ## Key Architecture Decisions
 
 - **tmux runs as ada** — not as the kiosk user. This keeps TMUX socket, BROWSER env, and loom-open all within ada's session boundary.
 - **loom-open** splits tmux to show QR codes — claude-code calls $BROWSER or xdg-open, both routed to loom-open.
 - **xdg-open shim** is only installed when not in `complete` phase to avoid conflicting with real xdg-open after desktop setup.
 - **Cage as universal launchpad** — one ISO, any destination. Cage is minimal Wayland that works on any hardware. The real compositor is chosen in conversation and applied via switch.
-- **Auto-login persists through compositor switch** — only removed when Ada configures the greeter in the final phase.
 - **`claude --continue`** resumes the setup conversation after the compositor switch so Ada can orient the user in the new desktop.
+- **Module doesn't manage display managers** — Ada configures the appropriate display manager (greetd, gdm, sddm) as part of desktop setup. The module only handles cage in kiosk phase. This keeps the module generic across all desktop environments (Wayland and X11).
+- **Mock approval during setup** — `/run/nuketown-broker/mode` is set to `MOCK_APPROVED` via tmpfiles during kiosk and desktop phases. No GUI session exists for the approval daemon, so sudo auto-approves. Removed in complete phase when the approval daemon runs normally.
+- **Human user password** — `initialPassword = "loom"` (configurable via `loom.humanPassword`). Ada helps change it during setup. Needed for tty login if the display manager isn't working.
+
+## Lessons Learned
+
+- **OAuth tokens default to Sonnet** regardless of Max subscription. Must pass `--model claude-opus-4-6` explicitly.
+- **`sudo kill` + chained commands** can fail silently — the signal from kill can propagate to the shell, preventing subsequent commands (like `rm`) from running. Always use separate commands.
+- **Prompt engineering matters** — Ada spent 5+ minutes exploring the loom module source until the prompt explicitly said "Do NOT read module source code" and described the `/etc/nixos/` file structure. Being specific about what files to edit and what's already in them saves significant time.
+- **The module should not mislead** — setting `services.displayManager.autoLogin` without enabling a display manager confused Ada into thinking auto-login was handled. Removed; Ada now configures the full display manager stack herself.
+- **Nix store overlay**: `writableStoreUseTmpfs = false` keeps the 9p host store as the read layer while putting writes on the 20GB disk. Best of both worlds for VM testing — host store dedup + sufficient write space.
+- **Ada handles complex configs well** — given "I like to code and I like omarchy's vibe", she produced a complete Tokyo Night Hyprland rice (waybar, fuzzel, foot, blur, animations, vim keybinds, screenshots, GTK dark theme) and correctly set up greetd with auto-login. She also pulled in zen-browser from a third-party flake, configured neovim with treesitter, created a shared workshop directory with proper Unix group permissions, and set a wallpaper.

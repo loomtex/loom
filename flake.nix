@@ -179,11 +179,9 @@
             nixpkgs.config.allowUnfreePredicate = pkg:
               builtins.elem (lib.getName pkg) [ "claude-code" ];
 
-            boot.loader.grub.device = "/dev/vda";
-            fileSystems."/" = {
-              device = "/dev/vda1";
-              fsType = "ext4";
-            };
+            boot.loader.systemd-boot.enable = true;
+            boot.loader.efi.canTouchEfiVariables = true;
+            boot.growPartition = true;  # expand root partition to fill diskSize on first boot
 
             networking.hostName = "loom";
 
@@ -202,14 +200,30 @@
               ];
             };
 
-            # VM resources and display
+            # VM resources and display — useBootLoader + useEFIBoot so
+            # nixos-rebuild switch inside the VM updates the bootloader
+            # and reboots boot the new system (not the original build).
             virtualisation.vmVariant = {
               virtualisation = {
                 memorySize = 4096;
                 cores = 4;
+                # Pin QEMU threads to P-cores (0-11) on hybrid Intel CPUs
+                qemu.package = let qemu = pkgs.qemu_kvm; in pkgs.runCommand "qemu-pinned" {
+                  nativeBuildInputs = [ pkgs.makeWrapper ];
+                } ''
+                  mkdir -p $out/bin
+                  for bin in ${qemu}/bin/*; do
+                    makeWrapper "$bin" "$out/bin/$(basename "$bin")" \
+                      --run '${pkgs.util-linux}/bin/taskset -p -c 0-11 $$ >/dev/null 2>&1 || true'
+                  done
+                '';
                 diskSize = 20480;
-                writableStoreUseTmpfs = false;  # use disk for overlay upper, keep 9p host store as lower
                 graphics = true;
+                useBootLoader = true;
+                useEFIBoot = true;
+                mountHostNixStore = true;       # re-enable 9p host store (useBootLoader defaults this off)
+                writableStore = true;            # overlayfs on top of the 9p share
+                writableStoreUseTmpfs = false;   # overlay upper on disk, not tmpfs
                 qemu.options = [
                   "-vga virtio"
                   "-display gtk,gl=on"
@@ -218,6 +232,25 @@
                   { from = "host"; host.port = 2222; guest.port = 22; }
                   { from = "host"; host.port = 9090; guest.port = 9090; }
                 ];
+                # Share host loom source into VM for testing local changes.
+                # Set LOOM_SRC env var to override the default path.
+                sharedDirectories.loom-src = {
+                  source = ''"''${LOOM_SRC:-/agents/ada/projects/loom}"'';
+                  target = "/tmp/loom-src";
+                  securityModel = "none";
+                };
+              };
+              # resize2fs after growpart expands the partition
+              systemd.services.growfs-root = {
+                wantedBy = [ "local-fs.target" ];
+                after = [ "growpart.service" "local-fs-pre.target" ];
+                wants = [ "growpart.service" ];
+                unitConfig.DefaultDependencies = false;
+                serviceConfig = {
+                  Type = "oneshot";
+                  RemainAfterExit = true;
+                  ExecStart = "${pkgs.e2fsprogs}/bin/resize2fs /dev/vda2";
+                };
               };
             };
           })
